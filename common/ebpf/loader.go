@@ -107,12 +107,9 @@ func attachProgramRawWithMode(
 	// fallback because there is no safe way to distinguish an empty hook from
 	// an unqueryable one.
 	if result, queryErr := queryCgroupPrograms(link.QueryOptions{Target: target, Attach: attachType}); queryErr == nil && len(result.Programs) > 0 {
-		if replacePassThrough {
-			// Only the interception backend owns the exclusive cgroup lock.
-			if _, cleanupErr := detachOwnedCgroupProgramsForAttach(target, attachType); cleanupErr != nil {
-				return legacyCgroupAttachment{}, E.Cause(cleanupErr, "clean stale eBPF cgroup program")
-			}
-		}
+		// Startup reclaims stale programs only while holding the exclusive
+		// cgroup lock. At attach time another live backend may own every
+		// program reported here; no interception program may be detached.
 		result, queryErr = queryCgroupPrograms(link.QueryOptions{Target: target, Attach: attachType})
 		if queryErr != nil {
 			return legacyCgroupAttachment{}, queryErr

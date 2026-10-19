@@ -165,9 +165,9 @@ func lockCgroupFile(cgroupFile *os.File) error {
 	return eBPFOperationError("lock cgroup", err)
 }
 
-func detachOwnedCgroupPrograms(cgroupFD int) error {
+func detachOwnedCgroupPrograms(cgroupFD int, slots ...int) error {
 	for _, definition := range cgroupProgramDefinitions {
-		if _, err := detachOwnedCgroupProgramsForAttach(cgroupFD, definition.attachType); err != nil {
+		if _, err := detachOwnedCgroupProgramsForAttach(cgroupFD, definition.attachType, slots...); err != nil {
 			if definition.attachType == CiliumEBPF.AttachCgroupInetSockRelease && socketReleaseUnavailable(err) {
 				continue
 			}
@@ -181,7 +181,7 @@ func detachOwnedCgroupPrograms(cgroupFD int) error {
 // sing-ebpf generation. Older releases used the sing_ebpf_ prefix, while the
 // current diagnostic names use sb_ebpf_. Never detach an unknown owner: the
 // caller may be sharing the host cgroup with netd or another eBPF service.
-func detachOwnedCgroupProgramsForAttach(cgroupFD int, attachType CiliumEBPF.AttachType) (bool, error) {
+func detachOwnedCgroupProgramsForAttach(cgroupFD int, attachType CiliumEBPF.AttachType, slots ...int) (bool, error) {
 	first, err := queryCgroupProgramIDs(cgroupFD, attachType)
 	if err != nil {
 		return false, err
@@ -199,7 +199,7 @@ func detachOwnedCgroupProgramsForAttach(cgroupFD int, attachType CiliumEBPF.Atta
 		if nameErr != nil {
 			return detached, nameErr
 		}
-		if ownedCgroupProgramName(name) {
+		if ownedCgroupProgramName(name) && (len(slots) == 0 || cgroupProgramSlot(name) == slots[0]) {
 			program, openErr := newProgramFromID(programID)
 			if openErr != nil {
 				return detached, openErr

@@ -490,6 +490,7 @@ func (b *SharedNetworkBackend) SweepOrphanedFlows(
 		},
 	)
 	if err != nil {
+		b.maintenance.record("sb_sh_orig", b.mapCapacity.Proxy, scan, 0, 0, false, err)
 		return SharedNetworkFlowSweepResult{}, err
 	}
 	if scan.Restarted {
@@ -524,6 +525,7 @@ func (b *SharedNetworkBackend) SweepOrphanedFlows(
 		}
 		b.flowSweepRemoved = 0
 	}
+	b.maintenance.record("sb_sh_orig", b.mapCapacity.Proxy, scan, result.Removed, result.Usage.Entries, result.Complete, sweepErr)
 	return result, sweepErr
 }
 

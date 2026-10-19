@@ -45,6 +45,7 @@ type sharedNetworkRuntime struct {
 }
 
 type SharedNetworkBackend struct {
+	maintenance         mapMaintenanceState
 	access              sync.RWMutex
 	health              backendHealth
 	flowAccess          sync.Mutex

@@ -173,12 +173,16 @@ func (s *sharedRewrite) Close() error {
 	s.stopFlowJanitor()
 	if s.dataPlane != nil {
 		closeErr = s.dataPlane.Close()
-		s.dataPlane = nil
+		if s.dataPlane.IsClosed() {
+			s.dataPlane = nil
+		}
 	}
 	s.purgeUDP()
 	backend := s.takeSharedBackend()
 	var backendErr error
-	if backend != nil {
+	if backend != nil && s.dataPlane != nil {
+		s.setSharedBackend(backend)
+	} else if backend != nil {
 		backendErr = backend.Close()
 		if !backend.IsClosed() {
 			s.setSharedBackend(backend)

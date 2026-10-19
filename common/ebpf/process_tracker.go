@@ -4,6 +4,7 @@ package ebpf
 
 import (
 	"slices"
+	"sync"
 
 	CiliumEBPF "github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/asm"
@@ -39,6 +40,7 @@ type processTrackerHook struct {
 // socket. Socket cookies let the TC data path carry that identity to userspace
 // without searching every process file descriptor under procfs.
 type ProcessTracker struct {
+	access              sync.RWMutex
 	owners              *CiliumEBPF.Map
 	policyUID           *CiliumEBPF.Map
 	metadata            *CiliumEBPF.Map
@@ -148,7 +150,12 @@ func (t *ProcessTracker) attachReleaseCleanup(cgroupPath string) {
 }
 
 func (t *ProcessTracker) ReleaseCleanup() bool {
-	return t != nil && t.releaseCleanup
+	if t == nil {
+		return false
+	}
+	t.access.RLock()
+	defer t.access.RUnlock()
+	return t.releaseCleanup
 }
 
 func newProcessTrackerReleaseProgram(ownerMapFD, metadataMapFD int) (*CiliumEBPF.Program, error) {
@@ -298,7 +305,12 @@ func (t *ProcessTracker) metadataFD() int {
 }
 
 func (t *ProcessTracker) LookupOwner(socketCookie uint64) (ProcessSocketOwner, error) {
-	if t == nil || t.owners == nil || socketCookie == 0 {
+	if t == nil || socketCookie == 0 {
+		return ProcessSocketOwner{}, E.New("invalid eBPF process owner lookup")
+	}
+	t.access.RLock()
+	defer t.access.RUnlock()
+	if t.owners == nil {
 		return ProcessSocketOwner{}, E.New("invalid eBPF process owner lookup")
 	}
 	var owner ProcessSocketOwner
@@ -312,6 +324,8 @@ func (t *ProcessTracker) Close() error {
 	if t == nil {
 		return nil
 	}
+	t.access.Lock()
+	defer t.access.Unlock()
 	var closeErr error
 	for index, programLink := range slices.Backward(t.links) {
 		if programLink == nil {
@@ -346,4 +360,13 @@ func (t *ProcessTracker) Close() error {
 		t.policyUID = nil
 	}
 	return closeErr
+}
+
+func (t *ProcessTracker) IsClosed() bool {
+	if t == nil {
+		return true
+	}
+	t.access.RLock()
+	defer t.access.RUnlock()
+	return t.owners == nil && t.policyUID == nil && lenOpenCgroupProgramLinks(t.links) == 0
 }
