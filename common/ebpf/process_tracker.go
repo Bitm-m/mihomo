@@ -45,6 +45,7 @@ type ProcessTracker struct {
 	policyDefaultBypass bool
 	programs            []*CiliumEBPF.Program
 	links               []cgroupProgramLink
+	releaseCleanup      bool
 }
 
 func AttachProcessTracker(config ProcessTrackerConfig) (*ProcessTracker, error) {
@@ -111,13 +112,15 @@ func AttachProcessTracker(config ProcessTrackerConfig) (*ProcessTracker, error) 
 			_ = tracker.Close()
 		}
 	}()
+	// Attach cleanup first so it remains until all metadata writers detach.
+	tracker.attachReleaseCleanup(cgroupPath)
 	for _, hook := range processTrackerHooks(config) {
 		program, loadErr := newProcessTrackerProgram(hook, owners.FD(), tracker.policyUIDFD(), tracker.metadataFD(), tracker.policyDefaultBypass)
 		if loadErr != nil {
 			return nil, loadErr
 		}
 		tracker.programs = append(tracker.programs, program)
-		programLink, attachErr := attachCgroupProgram(cgroupPath, program, hook.attachType)
+		programLink, attachErr := attachCgroupProgramShared(cgroupPath, program, hook.attachType)
 		if attachErr != nil {
 			return nil, E.Cause(attachErr, "attach eBPF process tracker ", hook.name, " hook")
 		}
@@ -125,6 +128,41 @@ func AttachProcessTracker(config ProcessTrackerConfig) (*ProcessTracker, error) 
 	}
 	complete = true
 	return tracker, nil
+}
+
+// The tracker observes application sockets beyond the self-bypass cgroup.
+// Clean both maps here; old/vendor kernels retain the bounded LRU fallback.
+func (t *ProcessTracker) attachReleaseCleanup(cgroupPath string) {
+	program, err := newProcessTrackerReleaseProgram(t.owners.FD(), t.metadataFD())
+	if err != nil {
+		return
+	}
+	programLink, err := attachCgroupProgramShared(cgroupPath, program, CiliumEBPF.AttachCgroupInetSockRelease)
+	if err != nil {
+		_ = program.Close()
+		return
+	}
+	t.programs = append(t.programs, program)
+	t.links = append(t.links, programLink)
+	t.releaseCleanup = true
+}
+
+func (t *ProcessTracker) ReleaseCleanup() bool {
+	return t != nil && t.releaseCleanup
+}
+
+func newProcessTrackerReleaseProgram(ownerMapFD, metadataMapFD int) (*CiliumEBPF.Program, error) {
+	program, err := CiliumEBPF.NewProgram(&CiliumEBPF.ProgramSpec{
+		Name:         "sb_proc_release",
+		Type:         CiliumEBPF.CGroupSock,
+		AttachType:   CiliumEBPF.AttachCgroupInetSockRelease,
+		License:      "GPL",
+		Instructions: socketCookieDeleteInstructions(ownerMapFD, metadataMapFD),
+	})
+	if err != nil {
+		return nil, E.Cause(err, "load eBPF process tracker socket-release hook")
+	}
+	return program, nil
 }
 
 func processTrackerHooks(config ProcessTrackerConfig) []processTrackerHook {
@@ -211,7 +249,7 @@ func processTrackerInstructions(ownerMapFD, policyUIDMapFD, metadataMapFD int, d
 		asm.Ja.Label("lookup_policy_uid"),
 		asm.StoreImm(asm.RFP, -28, 0, asm.Word).WithSymbol("metadata_empty"),
 		asm.LoadMem(asm.R0, asm.RFP, -12, asm.Word).WithSymbol("lookup_policy_uid"),
-		asm.BSwap(asm.R0, asm.Word),
+		asm.HostTo(asm.BE, asm.R0, asm.Word),
 		asm.StoreMem(asm.RFP, -20, asm.R0, asm.Word),
 		asm.LoadMapPtr(asm.R1, policyUIDMapFD),
 		asm.Mov.Reg(asm.R2, asm.RFP),
@@ -279,6 +317,9 @@ func (t *ProcessTracker) Close() error {
 		if programLink == nil {
 			continue
 		}
+		if index == 0 && t.releaseCleanup && lenOpenCgroupProgramLinks(t.links[1:]) > 0 {
+			continue
+		}
 		linkErr := programLink.Close()
 		closeErr = E.Errors(closeErr, linkErr)
 		if cgroupProgramLinkCloseComplete(programLink, linkErr) {
@@ -288,6 +329,7 @@ func (t *ProcessTracker) Close() error {
 	if lenOpenCgroupProgramLinks(t.links) > 0 {
 		return closeErr
 	}
+	t.releaseCleanup = false
 	for index, program := range slices.Backward(t.programs) {
 		if program == nil {
 			continue

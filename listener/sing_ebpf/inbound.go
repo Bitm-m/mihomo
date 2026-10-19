@@ -118,7 +118,7 @@ type Inbound struct {
 	tcDataPlaneAccess   sync.RWMutex
 	interfaceMonitor    tcInterfaceMonitor
 	lifecycleAccess     sync.RWMutex
-	localRoutes         []*localRoute
+	localRoutes         *localRouteSet
 
 	sharedRewrite *sharedRewrite
 
@@ -179,6 +179,7 @@ type interfaceWarningLimiters struct {
 	topology         warningLimiter
 	defaultInterface warningLimiter
 	infrastructure   warningLimiter
+	redirectRoutes   warningLimiter
 	hostPolicy       warningLimiter
 	reconcile        warningLimiter
 	// bypassRuleSet covers the scheduler's retries of a failed bypass_rule_set

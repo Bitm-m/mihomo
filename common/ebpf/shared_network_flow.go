@@ -492,6 +492,9 @@ func (b *SharedNetworkBackend) SweepOrphanedFlows(
 	if err != nil {
 		return SharedNetworkFlowSweepResult{}, err
 	}
+	if scan.Restarted {
+		b.flowSweepRemoved = 0
+	}
 	result := SharedNetworkFlowSweepResult{
 		Scanned:  scan.Scanned,
 		Usage:    MapUsage{Capacity: b.mapCapacity.Proxy},
@@ -540,8 +543,14 @@ func (b *SharedNetworkBackend) PurgeInterfaceFlows(interfaceIndex uint32, budget
 	if b.runtime == nil {
 		return 0, false, errBackendClosed
 	}
+	// Purging must cover this interface from the start, independently of an
+	// idle sweep that may already have visited a prefix of the map.
+	if b.flowPurgeInterface != interfaceIndex {
+		b.flowPurgeScratch = mapScanScratch[sharedNetworkOriginalKey, sharedNetworkTokenValue]{}
+		b.flowPurgeInterface = interfaceIndex
+	}
 	b.flowSweepCandidates = b.flowSweepCandidates[:0]
-	scan, err := b.flowSweepScratch.scan(
+	scan, err := b.flowPurgeScratch.scan(
 		b.runtime.maps["shared_flow_by_original"],
 		b.mapCapacity.Proxy,
 		budget,

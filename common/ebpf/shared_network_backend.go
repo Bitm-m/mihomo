@@ -55,6 +55,8 @@ type SharedNetworkBackend struct {
 	flowWake            chan struct{}
 	flowSweepAccess     sync.Mutex
 	flowSweepScratch    mapScanScratch[sharedNetworkOriginalKey, sharedNetworkTokenValue]
+	flowPurgeScratch    mapScanScratch[sharedNetworkOriginalKey, sharedNetworkTokenValue]
+	flowPurgeInterface  uint32
 	flowSweepCandidates []sharedNetworkFlowEntry
 	flowSweepRemoved    uint32
 	runtime             *sharedNetworkRuntime

@@ -590,6 +590,13 @@ func (i *Inbound) updateTCInterfaces(ctx context.Context) (outcome tcUpdateOutco
 		i.interfaceWarnings.inventory.warn(i.logWarn, "update interfaces for TC eBPF: ", err)
 		outcome.general = tcSharedRewriteRecoverable
 	}
+	// Route reconciliation also dumps netlink state. The monitor is joined
+	// before shutdown releases localRoutes; keep this work outside the lock
+	// used by every UDP packet.
+	if _, err := i.localRoutes.ReconcileInterfaceRoutes(); err != nil {
+		i.interfaceWarnings.redirectRoutes.warn(i.logWarn, "refresh eBPF redirect interface routes: ", err)
+		outcome.general = tcSharedRewriteRecoverable
+	}
 
 	i.lifecycleAccess.Lock()
 	defer i.lifecycleAccess.Unlock()

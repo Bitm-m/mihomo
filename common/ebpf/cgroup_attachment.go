@@ -36,16 +36,54 @@ func cgroupProgramLinkCloseComplete(programLink cgroupProgramLink, closeErr erro
 	return !retryable || retryableLink.IsClosed()
 }
 
+// attachRawLink is replaced in tests to exercise the legacy fallbacks without
+// a kernel that rejects BPF_LINK_CREATE.
+var attachRawLink = link.AttachRawLink
+
+// cgroupAttachPolicy selects whether a legacy cgroup attachment may end in
+// the kernel's single-program mode.
+type cgroupAttachPolicy uint8
+
+const (
+	// cgroupAttachAllowExclusive permits the unflagged legacy fallback on an
+	// empty hook when the kernel rejects multi-program attachment. Use it only
+	// for a component that owns its cgroup or has no other fallback.
+	cgroupAttachAllowExclusive cgroupAttachPolicy = iota
+	// cgroupAttachMultiOnly never leaves the hook in single-program mode. A
+	// single-program hook makes the kernel reject every later multi-program
+	// attachment, including BPF_LINK_CREATE, so an optional component that
+	// shares a cgroup with the interception backend must not create one.
+	cgroupAttachMultiOnly
+)
+
 // attachCgroupProgram prefers BPF_LINK_CREATE, whose cgroup implementation is
 // inherently multi-program, then falls back to legacy BPF_PROG_ATTACH. The
 // legacy path tries BPF_F_ALLOW_MULTI first and retries without flags only when
-// the kernel rejects multi attachment with a compatibility error.
+// the kernel rejects multi attachment with a compatibility error and the hook
+// is empty.
 func attachCgroupProgram(path string, program *CiliumEBPF.Program, attachType CiliumEBPF.AttachType) (cgroupProgramLink, error) {
+	return attachCgroupProgramWithPolicy(path, program, attachType, cgroupAttachAllowExclusive)
+}
+
+// attachCgroupProgramShared attaches an optional program to a cgroup that may
+// also carry the interception backend. It uses only multi-program operations,
+// so a kernel that rejects them makes the optional feature unavailable instead
+// of locking the required backend out of the same hook.
+func attachCgroupProgramShared(path string, program *CiliumEBPF.Program, attachType CiliumEBPF.AttachType) (cgroupProgramLink, error) {
+	return attachCgroupProgramWithPolicy(path, program, attachType, cgroupAttachMultiOnly)
+}
+
+func attachCgroupProgramWithPolicy(
+	path string,
+	program *CiliumEBPF.Program,
+	attachType CiliumEBPF.AttachType,
+	policy cgroupAttachPolicy,
+) (cgroupProgramLink, error) {
 	cgroupFile, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	programLink, linkErr := link.AttachRawLink(link.RawLinkOptions{
+	programLink, linkErr := attachRawLink(link.RawLinkOptions{
 		Target:  int(cgroupFile.Fd()),
 		Program: program,
 		Attach:  attachType,
@@ -58,7 +96,12 @@ func attachCgroupProgram(path string, program *CiliumEBPF.Program, attachType Ci
 		_ = cgroupFile.Close()
 		return nil, linkErr
 	}
-	if err = attachProgramRaw(int(cgroupFile.Fd()), program, attachType); err != nil {
+	if policy == cgroupAttachMultiOnly {
+		err = attachProgramRawMultiOnly(int(cgroupFile.Fd()), program, attachType)
+	} else {
+		err = attachProgramRaw(int(cgroupFile.Fd()), program, attachType)
+	}
+	if err != nil {
 		_ = cgroupFile.Close()
 		return nil, E.Errors(linkErr, err)
 	}

@@ -53,9 +53,9 @@ func TestProcessCgroupExclusiveRejectsPopulatedDescendant(t *testing.T) {
 
 func TestSelfBypassInstructionsUseSocketCookie(t *testing.T) {
 	for name, instructions := range map[string]asm.Instructions{
-		"create":      selfBypassCreateInstructions(1),
+		"create":      selfBypassCreateInstructions(1, 42),
 		"release":     selfBypassReleaseInstructions(1),
-		"socket_addr": selfBypassSocketAddrInstructions(1),
+		"socket_addr": selfBypassSocketAddrInstructions(1, 42),
 	} {
 		found := false
 		for _, instruction := range instructions {
@@ -67,6 +67,23 @@ func TestSelfBypassInstructionsUseSocketCookie(t *testing.T) {
 		if !found {
 			t.Fatalf("%s self-bypass instructions do not read the socket cookie", name)
 		}
+	}
+}
+
+func TestSelfBypassOwnerTGID(t *testing.T) {
+	namespace, err := os.Readlink("/proc/self/ns/pid")
+	if err != nil {
+		t.Skipf("PID namespace is not readable: %v", err)
+	}
+	owner, err := selfBypassOwnerTGID()
+	if namespace != initialPIDNamespaceLink {
+		if err == nil {
+			t.Fatalf("owner %d accepted outside the initial PID namespace (%s)", owner, namespace)
+		}
+		return
+	}
+	if err != nil || owner != uint32(os.Getpid()) {
+		t.Fatalf("owner = %d, %v; want %d", owner, err, os.Getpid())
 	}
 }
 
@@ -101,6 +118,7 @@ func TestSelfBypassModes(t *testing.T) {
 		{SelfBypassUserspace, "userspace_socket_cookie", "lru_fallback", false},
 		{SelfBypassCgroupSocket, "cgroup_socket_cookie", "socket_release", true},
 		{SelfBypassCgroupSocketAddr, "cgroup_socket_addr", "lru_fallback", true},
+		{SelfBypassCgroupSocketAddrRelease, "cgroup_socket_addr_release", "socket_release", true},
 		{SelfBypassUserspaceRelease, "userspace_socket_cookie_release", "socket_release", false},
 	}
 	for _, test := range tests {

@@ -4,6 +4,7 @@ package ebpf
 
 import (
 	"bufio"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -51,6 +52,8 @@ const (
 	// when socket-create/connect hooks are unavailable, including TC-only
 	// deployments where the cgroup data plane is not loaded.
 	SelfBypassUserspaceRelease
+	// Socket-address marking can also use optional socket-release cleanup.
+	SelfBypassCgroupSocketAddrRelease
 )
 
 func (m SelfBypassMode) String() string {
@@ -59,6 +62,8 @@ func (m SelfBypassMode) String() string {
 		return "cgroup_socket_cookie"
 	case SelfBypassCgroupSocketAddr:
 		return "cgroup_socket_addr"
+	case SelfBypassCgroupSocketAddrRelease:
+		return "cgroup_socket_addr_release"
 	case SelfBypassUserspaceRelease:
 		return "userspace_socket_cookie_release"
 	default:
@@ -70,7 +75,7 @@ func (m SelfBypassMode) String() string {
 // lru_fallback is a safety net, not a precise socket lifecycle mechanism.
 func (m SelfBypassMode) CleanupMode() string {
 	switch m {
-	case SelfBypassCgroupSocket, SelfBypassUserspaceRelease:
+	case SelfBypassCgroupSocket, SelfBypassUserspaceRelease, SelfBypassCgroupSocketAddrRelease:
 		return "socket_release"
 	default:
 		return "lru_fallback"
@@ -142,31 +147,62 @@ func (b *SelfBypass) AttachCgroup(config SelfBypassCgroupConfig) error {
 	if exclusiveErr != nil {
 		attachErrors = append(attachErrors, exclusiveErr)
 	}
+	var ownerTGID uint32
 	if exclusive {
-		createReleaseErr := b.attachCgroupSocket(cgroupPath)
+		var ownerErr error
+		ownerTGID, ownerErr = selfBypassOwner()
+		if ownerErr != nil {
+			attachErrors = append(attachErrors, ownerErr)
+			exclusive = false
+		}
+	} else if exclusiveErr == nil {
+		attachErrors = append(attachErrors, E.New("process cgroup contains other processes"))
+	}
+	if exclusive {
+		createReleaseErr := b.attachCgroupSocket(cgroupPath, ownerTGID)
 		if createReleaseErr == nil {
-			b.mode.Store(uint32(SelfBypassCgroupSocket))
-			return nil
+			createReleaseErr = b.verifyOwnerMarking(false, config)
+			if createReleaseErr == nil {
+				b.mode.Store(uint32(SelfBypassCgroupSocket))
+				return nil
+			}
+			if closeErr := b.closeHooks(); closeErr != nil {
+				return E.Errors(createReleaseErr, closeErr)
+			}
 		}
 		attachErrors = append(attachErrors, createReleaseErr)
 		if lenOpenCgroupProgramLinks(b.links) > 0 {
 			return E.Errors(attachErrors...)
 		}
-		socketAddrErr := b.attachCgroupSocketAddr(cgroupPath, config)
+		socketAddrErr := b.attachCgroupSocketAddr(cgroupPath, config, ownerTGID)
 		if socketAddrErr == nil {
-			b.mode.Store(uint32(SelfBypassCgroupSocketAddr))
-			return nil
+			socketAddrErr = b.verifyOwnerMarking(true, config)
+			if socketAddrErr == nil {
+				if b.attachCgroupRelease(cgroupPath) == nil {
+					b.mode.Store(uint32(SelfBypassCgroupSocketAddrRelease))
+				} else {
+					// Keep the address hooks active when the optional release hook is
+					// unavailable. LRU remains the safe fallback for this path.
+					b.mode.Store(uint32(SelfBypassCgroupSocketAddr))
+				}
+				return nil
+			}
+			if closeErr := b.closeHooks(); closeErr != nil {
+				return E.Errors(socketAddrErr, closeErr)
+			}
 		}
 		attachErrors = append(attachErrors, socketAddrErr)
 		if lenOpenCgroupProgramLinks(b.links) > 0 {
 			return E.Errors(attachErrors...)
 		}
-	} else if exclusiveErr == nil {
-		attachErrors = append(attachErrors, E.New("process cgroup contains other processes"))
 	}
 
 	// A release-only hook is safe on a shared cgroup: it only deletes entries
 	// whose cookies are already present in our map, and never marks sockets.
+	// The process cgroup is shared in this branch.  A release-only helper is
+	// optional and must never turn a shared hook into legacy single-program
+	// mode, otherwise the interception backend cannot attach its own
+	// multi-program/link hook afterwards.
 	if releaseErr := b.attachCgroupRelease(cgroupPath); releaseErr == nil {
 		b.mode.Store(uint32(SelfBypassUserspaceRelease))
 		return nil
@@ -181,7 +217,7 @@ func (b *SelfBypass) CgroupAttached() bool {
 		return false
 	}
 	mode := SelfBypassMode(b.mode.Load())
-	return mode == SelfBypassCgroupSocket || mode == SelfBypassCgroupSocketAddr
+	return mode == SelfBypassCgroupSocket || mode == SelfBypassCgroupSocketAddr || mode == SelfBypassCgroupSocketAddrRelease
 }
 
 func (b *SelfBypass) Mode() SelfBypassMode {
@@ -191,8 +227,8 @@ func (b *SelfBypass) Mode() SelfBypassMode {
 	return SelfBypassMode(b.mode.Load())
 }
 
-func (b *SelfBypass) attachCgroupSocket(path string) error {
-	createProgram, err := newSelfBypassCreateProgram(b.sockets.FD())
+func (b *SelfBypass) attachCgroupSocket(path string, ownerTGID uint32) error {
+	createProgram, err := newSelfBypassCreateProgram(b.sockets.FD(), ownerTGID)
 	if err != nil {
 		return err
 	}
@@ -227,17 +263,17 @@ func (b *SelfBypass) attachCgroupRelease(path string) error {
 	if err != nil {
 		return err
 	}
-	programLink, err := attachCgroupProgram(path, program, CiliumEBPF.AttachCgroupInetSockRelease)
+	programLink, err := attachCgroupProgramShared(path, program, CiliumEBPF.AttachCgroupInetSockRelease)
 	if err != nil {
 		_ = program.Close()
 		return E.Cause(err, "attach eBPF self-bypass socket-release cleanup hook")
 	}
-	b.programs = []*CiliumEBPF.Program{program}
-	b.links = []cgroupProgramLink{programLink}
+	b.programs = append(b.programs, program)
+	b.links = append(b.links, programLink)
 	return nil
 }
 
-func (b *SelfBypass) attachCgroupSocketAddr(path string, config SelfBypassCgroupConfig) error {
+func (b *SelfBypass) attachCgroupSocketAddr(path string, config SelfBypassCgroupConfig, ownerTGID uint32) error {
 	hooks := selfBypassSocketAddrHooks(config)
 	programs := make([]*CiliumEBPF.Program, 0, len(hooks))
 	links := make([]cgroupProgramLink, 0, len(hooks))
@@ -247,7 +283,7 @@ func (b *SelfBypass) attachCgroupSocketAddr(path string, config SelfBypassCgroup
 		return b.closeHooks()
 	}
 	for _, hook := range hooks {
-		program, err := newSelfBypassSocketAddrProgram(b.sockets.FD(), hook)
+		program, err := newSelfBypassSocketAddrProgram(b.sockets.FD(), hook, ownerTGID)
 		if err != nil {
 			return E.Errors(err, closeAttached())
 		}
@@ -286,13 +322,13 @@ func selfBypassSocketAddrHooks(config SelfBypassCgroupConfig) []selfBypassSocket
 	return hooks
 }
 
-func newSelfBypassCreateProgram(mapFD int) (*CiliumEBPF.Program, error) {
+func newSelfBypassCreateProgram(mapFD int, ownerTGID uint32) (*CiliumEBPF.Program, error) {
 	program, err := CiliumEBPF.NewProgram(&CiliumEBPF.ProgramSpec{
 		Name:         "sb_self_create",
 		Type:         CiliumEBPF.CGroupSock,
 		AttachType:   CiliumEBPF.AttachCGroupInetSockCreate,
 		License:      "GPL",
-		Instructions: selfBypassCreateInstructions(mapFD),
+		Instructions: selfBypassCreateInstructions(mapFD, ownerTGID),
 	})
 	if err != nil {
 		return nil, E.Cause(err, "load eBPF self-bypass socket-create hook")
@@ -314,13 +350,13 @@ func newSelfBypassReleaseProgram(mapFD int) (*CiliumEBPF.Program, error) {
 	return program, nil
 }
 
-func newSelfBypassSocketAddrProgram(mapFD int, hook selfBypassSocketAddrHook) (*CiliumEBPF.Program, error) {
+func newSelfBypassSocketAddrProgram(mapFD int, hook selfBypassSocketAddrHook, ownerTGID uint32) (*CiliumEBPF.Program, error) {
 	program, err := CiliumEBPF.NewProgram(&CiliumEBPF.ProgramSpec{
 		Name:         hook.kernelProgramName,
 		Type:         CiliumEBPF.CGroupSockAddr,
 		AttachType:   hook.attachType,
 		License:      "GPL",
-		Instructions: selfBypassSocketAddrInstructions(mapFD),
+		Instructions: selfBypassSocketAddrInstructions(mapFD, ownerTGID),
 	})
 	if err != nil {
 		return nil, E.Cause(err, "load eBPF self-bypass ", hook.hookName, " hook")
@@ -328,8 +364,23 @@ func newSelfBypassSocketAddrProgram(mapFD int, hook selfBypassSocketAddrHook) (*
 	return program, nil
 }
 
-func selfBypassCreateInstructions(mapFD int) asm.Instructions {
+// selfBypassOwnerCheckInstructions skips marking unless the current task
+// belongs to ownerTGID. bpf_get_current_pid_tgid reports the thread-group id in
+// the initial PID namespace, which selfBypassOwnerTGID guarantees equals
+// os.Getpid. The context pointer is kept in R6 across the helper call and
+// restored to R1 for the socket-cookie helper that follows.
+func selfBypassOwnerCheckInstructions(ownerTGID uint32) asm.Instructions {
 	return asm.Instructions{
+		asm.Mov.Reg(asm.R6, asm.R1),
+		asm.FnGetCurrentPidTgid.Call(),
+		asm.RSh.Imm(asm.R0, 32),
+		asm.JNE.Imm(asm.R0, int32(ownerTGID), "allow"),
+		asm.Mov.Reg(asm.R1, asm.R6),
+	}
+}
+
+func selfBypassCreateInstructions(mapFD int, ownerTGID uint32) asm.Instructions {
+	return append(selfBypassOwnerCheckInstructions(ownerTGID),
 		asm.FnGetSocketCookie.Call(),
 		asm.JEq.Imm(asm.R0, 0, "allow"),
 		asm.StoreMem(asm.RFP, -8, asm.R0, asm.DWord),
@@ -343,29 +394,39 @@ func selfBypassCreateInstructions(mapFD int) asm.Instructions {
 		asm.FnMapUpdateElem.Call(),
 		asm.Mov.Imm(asm.R0, 1).WithSymbol("allow"),
 		asm.Return(),
-	}
+	)
 }
 
 func selfBypassReleaseInstructions(mapFD int) asm.Instructions {
 	return socketCookieDeleteInstructions(mapFD)
 }
 
-func socketCookieDeleteInstructions(mapFD int) asm.Instructions {
-	return asm.Instructions{
+func socketCookieDeleteInstructions(mapFDs ...int) asm.Instructions {
+	instructions := asm.Instructions{
 		asm.FnGetSocketCookie.Call(),
 		asm.JEq.Imm(asm.R0, 0, "allow"),
 		asm.StoreMem(asm.RFP, -8, asm.R0, asm.DWord),
-		asm.LoadMapPtr(asm.R1, mapFD),
-		asm.Mov.Reg(asm.R2, asm.RFP),
-		asm.Add.Imm(asm.R2, -8),
-		asm.FnMapDeleteElem.Call(),
+	}
+	for _, mapFD := range mapFDs {
+		if mapFD < 0 {
+			continue
+		}
+		// Independent LRU eviction must not prevent cleanup in another map.
+		instructions = append(instructions,
+			asm.LoadMapPtr(asm.R1, mapFD),
+			asm.Mov.Reg(asm.R2, asm.RFP),
+			asm.Add.Imm(asm.R2, -8),
+			asm.FnMapDeleteElem.Call(),
+		)
+	}
+	return append(instructions,
 		asm.Mov.Imm(asm.R0, 1).WithSymbol("allow"),
 		asm.Return(),
-	}
+	)
 }
 
-func selfBypassSocketAddrInstructions(mapFD int) asm.Instructions {
-	return asm.Instructions{
+func selfBypassSocketAddrInstructions(mapFD int, ownerTGID uint32) asm.Instructions {
+	return append(selfBypassOwnerCheckInstructions(ownerTGID),
 		asm.FnGetSocketCookie.Call(),
 		asm.JEq.Imm(asm.R0, 0, "allow"),
 		asm.StoreMem(asm.RFP, -8, asm.R0, asm.DWord),
@@ -391,7 +452,7 @@ func selfBypassSocketAddrInstructions(mapFD int) asm.Instructions {
 		asm.FnMapUpdateElem.Call(),
 		asm.Mov.Imm(asm.R0, 1).WithSymbol("allow"),
 		asm.Return(),
-	}
+	)
 }
 
 // RegisterSocket records a socket created by the consumer when cgroup hooks
@@ -435,7 +496,7 @@ func (b *SelfBypass) UnregisterSocket(rawConn syscall.RawConn) error {
 	}
 	b.access.RLock()
 	defer b.access.RUnlock()
-	if b.sockets == nil || b.CgroupAttached() {
+	if b.sockets == nil || b.Mode().CleanupMode() == "socket_release" {
 		return nil
 	}
 	var cookie uint64
@@ -452,6 +513,73 @@ func (b *SelfBypass) UnregisterSocket(rawConn syscall.RawConn) error {
 	}
 	if err = b.sockets.Delete(&cookie); err != nil {
 		return E.Cause(err, "unregister eBPF self-bypass socket")
+	}
+	return nil
+}
+
+// initialPIDNamespaceLink is the /proc/<pid>/ns/pid link of the initial PID
+// namespace (PROC_PID_INIT_INO). bpf_get_current_pid_tgid reports ids in that
+// namespace only.
+const initialPIDNamespaceLink = "pid:[4026531836]"
+
+// selfBypassProbePort is the discard port used by the socket-address probe.
+// The probe only connects a UDP socket or sends an empty datagram to loopback.
+const selfBypassProbePort = 9
+
+// selfBypassOwner resolves the marking owner; tests replace it to force the
+// post-attach probe to fail.
+var selfBypassOwner = selfBypassOwnerTGID
+
+// selfBypassOwnerTGID returns the thread-group id the marking hooks compare
+// against. It fails outside the initial PID namespace, where os.Getpid does not
+// match the id the kernel helper reports, so automatic marking is not used.
+func selfBypassOwnerTGID() (uint32, error) {
+	namespace, err := os.Readlink("/proc/self/ns/pid")
+	if err != nil {
+		return 0, E.Cause(err, "read process PID namespace")
+	}
+	if namespace != initialPIDNamespaceLink {
+		return 0, E.New("process is not in the initial PID namespace: ", namespace)
+	}
+	pid := os.Getpid()
+	if pid <= 0 || pid > math.MaxInt32 {
+		return 0, E.New("process id out of range: ", pid)
+	}
+	return uint32(pid), nil
+}
+
+// verifyOwnerMarking checks on the running kernel that a socket of this
+// process is marked by the hooks just attached. In cgroup mode the consumer
+// stops registering sockets itself, so hooks that silently mark nothing would
+// let its own traffic be intercepted. socketAddr selects the connect/sendmsg
+// hooks, which mark on use rather than on creation.
+func (b *SelfBypass) verifyOwnerMarking(socketAddr bool, config SelfBypassCgroupConfig) error {
+	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return E.Cause(err, "create eBPF self-bypass probe socket")
+	}
+	defer unix.Close(fd)
+	if socketAddr {
+		address := &unix.SockaddrInet4{Port: selfBypassProbePort, Addr: [4]byte{127, 0, 0, 1}}
+		if config.EnableTCP {
+			// connect4 also runs for UDP connect and sends nothing.
+			err = unix.Connect(fd, address)
+		} else {
+			err = unix.Sendto(fd, nil, 0, address)
+		}
+		if err != nil {
+			return E.Cause(err, "trigger eBPF self-bypass probe hook")
+		}
+	}
+	cookie, err := unix.GetsockoptUint64(fd, unix.SOL_SOCKET, unix.SO_COOKIE)
+	if err != nil {
+		return E.Cause(err, "read eBPF self-bypass probe socket cookie")
+	}
+	var metadata uint32
+	lookupErr := b.sockets.Lookup(&cookie, &metadata)
+	_ = b.sockets.Delete(&cookie)
+	if lookupErr != nil || metadata&SocketMetadataSelfBypass == 0 {
+		return E.New("eBPF self-bypass hooks did not mark a socket of this process")
 	}
 	return nil
 }
