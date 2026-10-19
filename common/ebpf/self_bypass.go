@@ -4,6 +4,7 @@ package ebpf
 
 import (
 	"bufio"
+	"errors"
 	"math"
 	"os"
 	"path/filepath"
@@ -29,7 +30,9 @@ const (
 // or by the socket control callback when cgroup attachment is unavailable.
 type SelfBypass struct {
 	access   sync.RWMutex
+	capacity uint32
 	sockets  *CiliumEBPF.Map
+	closed   bool
 	programs []*CiliumEBPF.Program
 	links    []cgroupProgramLink
 	mode     atomic.Uint32
@@ -90,22 +93,57 @@ func NewSelfBypassWithCapacity(capacity uint32) (*SelfBypass, error) {
 	if capacity == 0 || capacity > MaxConfigurableMapCapacity {
 		return nil, E.New("invalid eBPF self-bypass socket map capacity: ", capacity)
 	}
-	_ = raiseMemlockLimit()
+	return &SelfBypass{capacity: capacity}, nil
+}
+
+var errSelfBypassClosed = E.New("eBPF self-bypass is closed")
+
+// Prepare creates the socket-cookie map at startup, after configuration
+// validation and before interception or socket protection can use it.
+func (b *SelfBypass) Prepare() error {
+	_, err := b.PreparedMap()
+	return err
+}
+
+// PreparedMap creates the map if needed and returns it for sharing with data
+// planes. Callers borrow the map and must not close it.
+func (b *SelfBypass) PreparedMap() (*CiliumEBPF.Map, error) {
+	if b == nil {
+		return nil, E.New("eBPF self-bypass map is unavailable")
+	}
+	b.access.Lock()
+	defer b.access.Unlock()
+	return b.prepareMapLocked()
+}
+
+func (b *SelfBypass) prepareMapLocked() (*CiliumEBPF.Map, error) {
+	if b.closed {
+		return nil, errSelfBypassClosed
+	}
+	if b.sockets != nil {
+		return b.sockets, nil
+	}
+	if b.capacity == 0 {
+		return nil, E.New("eBPF self-bypass map is unavailable")
+	}
+	memlockErr := raiseMemlockLimit()
 	sockets, err := CiliumEBPF.NewMap(&CiliumEBPF.MapSpec{
 		Name:       "sb_self_sockets",
 		Type:       CiliumEBPF.LRUHash,
 		KeySize:    8,
 		ValueSize:  4,
-		MaxEntries: capacity,
+		MaxEntries: b.capacity,
 	})
 	if err != nil {
-		return nil, E.Cause(err, "create eBPF self-bypass socket map")
+		return nil, E.Cause(explainBPFPermissionError(err, memlockErr), "create eBPF self-bypass socket map")
 	}
-	return &SelfBypass{sockets: sockets}, nil
+	b.sockets = sockets
+	return sockets, nil
 }
 
-// Map returns the map that must be shared with the local TC programs. The map
-// is borrowed: callers must not close or retain it beyond SelfBypass.Close.
+// Map returns the existing map, or nil before preparation. Call Prepare first
+// or use PreparedMap to create it. The map is borrowed: callers must not close
+// or retain it beyond SelfBypass.Close.
 func (b *SelfBypass) Map() *CiliumEBPF.Map {
 	if b == nil {
 		return nil
@@ -127,8 +165,8 @@ func (b *SelfBypass) AttachCgroup(config SelfBypassCgroupConfig) error {
 	}
 	b.access.Lock()
 	defer b.access.Unlock()
-	if b.sockets == nil {
-		return E.New("eBPF self-bypass map is unavailable")
+	if _, err := b.prepareMapLocked(); err != nil {
+		return err
 	}
 	if b.mode.Load() != uint32(SelfBypassUserspace) {
 		return nil
@@ -463,6 +501,15 @@ func (b *SelfBypass) RegisterSocket(rawConn syscall.RawConn) error {
 		return nil
 	}
 	b.access.RLock()
+	if b.sockets == nil && !b.closed {
+		b.access.RUnlock()
+		// A socket registered before startup must use the same map the data
+		// plane later receives. Concurrent Close must not recreate that map.
+		if _, err := b.PreparedMap(); err != nil && !errors.Is(err, errSelfBypassClosed) {
+			return err
+		}
+		b.access.RLock()
+	}
 	defer b.access.RUnlock()
 	if b.sockets == nil {
 		return nil
@@ -701,6 +748,8 @@ func (b *SelfBypass) Close() error {
 	}
 	b.access.Lock()
 	defer b.access.Unlock()
+	// Closing may need a retry to detach hooks, but preparation must stop now.
+	b.closed = true
 	closeErr := b.closeHooks()
 	if lenOpenCgroupProgramLinks(b.links) > 0 {
 		return closeErr
@@ -718,5 +767,5 @@ func (b *SelfBypass) IsClosed() bool {
 	}
 	b.access.RLock()
 	defer b.access.RUnlock()
-	return b.sockets == nil && lenOpenCgroupProgramLinks(b.links) == 0
+	return b.closed && b.sockets == nil && lenOpenCgroupProgramLinks(b.links) == 0
 }

@@ -3,6 +3,7 @@
 package ebpf
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -11,6 +12,52 @@ import (
 	CiliumEBPF "github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/asm"
 )
+
+func TestSelfBypassPreparationLifecycle(t *testing.T) {
+	bypass, err := NewSelfBypassWithCapacity(64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bypass.Map() != nil || bypass.IsClosed() {
+		t.Fatal("construction must leave an open owner without a kernel map")
+	}
+	if err = bypass.Close(); err != nil || !bypass.IsClosed() {
+		t.Fatalf("close unprepared owner: %v", err)
+	}
+	if err = bypass.Prepare(); !errors.Is(err, errSelfBypassClosed) {
+		t.Fatalf("prepare after close = %v", err)
+	}
+	if err = bypass.AttachCgroup(SelfBypassCgroupConfig{EnableUDP: true}); !errors.Is(err, errSelfBypassClosed) {
+		t.Fatalf("attach after close = %v", err)
+	}
+	// A callback already copied by the dialer may run after unregistration.
+	if err = bypass.RegisterSocket(nil); err != nil || bypass.Map() != nil {
+		t.Fatalf("late socket callback recreated a closed map: %v", err)
+	}
+}
+
+func TestSelfBypassPreparationStopsWhileCloseNeedsRetry(t *testing.T) {
+	hook := &trackerTestLink{err: errors.New("detach failed")}
+	bypass := &SelfBypass{capacity: 64, links: []cgroupProgramLink{hook}}
+	if err := bypass.Close(); !errors.Is(err, hook.err) || bypass.IsClosed() {
+		t.Fatalf("pending detach was lost: %v", err)
+	}
+	if err := bypass.Prepare(); !errors.Is(err, errSelfBypassClosed) {
+		t.Fatalf("preparation was allowed during close: %v", err)
+	}
+	hook.err = nil
+	if err := bypass.Close(); err != nil || !bypass.IsClosed() {
+		t.Fatalf("close retry did not finish: %v", err)
+	}
+}
+
+func TestNewSelfBypassRejectsInvalidCapacity(t *testing.T) {
+	for _, capacity := range []uint32{0, MaxConfigurableMapCapacity + 1} {
+		if _, err := NewSelfBypassWithCapacity(capacity); err == nil {
+			t.Fatalf("capacity %d was accepted", capacity)
+		}
+	}
+}
 
 func TestProcessCgroupExclusive(t *testing.T) {
 	directory := t.TempDir()

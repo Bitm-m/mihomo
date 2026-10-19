@@ -229,6 +229,9 @@ func TestSelfBypassSocketAddrHooksMarkOnlyOwnerProcess(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer bypass.Close()
+	if err = bypass.Prepare(); err != nil {
+		t.Fatal(err)
+	}
 	for _, config := range []SelfBypassCgroupConfig{
 		{EnableTCP: true, EnableUDP: true, EnableIPv6: true},
 		{EnableUDP: true},

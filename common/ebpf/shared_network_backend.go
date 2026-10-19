@@ -172,7 +172,9 @@ func PrepareSharedNetwork(cgroupBackend *CgroupBackend, config SharedNetworkConf
 			verifierErrorStage(err),
 			err,
 		)
-		if memlockErr != nil && (errors.Is(err, unix.ENOMEM) || errors.Is(err, unix.EPERM)) {
+		if errors.Is(err, unix.EPERM) {
+			prepareErr = explainBPFPermissionError(prepareErr, memlockErr)
+		} else if memlockErr != nil && errors.Is(err, unix.ENOMEM) {
 			prepareErr = E.Errors(prepareErr, E.Cause(memlockErr, "remove memlock limit"))
 		}
 		return nil, prepareErr

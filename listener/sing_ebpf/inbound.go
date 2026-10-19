@@ -484,6 +484,9 @@ func (i *Inbound) start() error {
 		}
 	}
 	if i.selfBypass != nil {
+		if err := i.selfBypass.Prepare(); err != nil {
+			return E.Cause(err, "prepare eBPF self-bypass sockets")
+		}
 		selfBypass := i.selfBypass
 		i.unregisterSocketProtect = dialer.RegisterSocketProtectFunc(func(_ context.Context, network, address string, rawConn syscall.RawConn) error {
 			return selfBypass.RegisterSocket(rawConn)

@@ -52,7 +52,7 @@ func AttachProcessTracker(config ProcessTrackerConfig) (*ProcessTracker, error) 
 	if !config.EnableTCP && !config.EnableUDP {
 		return nil, E.New("process tracker has no enabled protocol")
 	}
-	_ = raiseMemlockLimit()
+	memlockErr := raiseMemlockLimit()
 	cgroupPath, err := DetectCgroup2Root()
 	if err != nil {
 		return nil, E.Cause(err, "detect cgroup v2 root")
@@ -65,7 +65,7 @@ func AttachProcessTracker(config ProcessTrackerConfig) (*ProcessTracker, error) 
 		MaxEntries: processSocketOwnerCapacity,
 	})
 	if err != nil {
-		return nil, E.Cause(err, "create eBPF process owner map")
+		return nil, E.Cause(explainBPFPermissionError(err, memlockErr), "create eBPF process owner map")
 	}
 	uidEntries, defaultBypass, err := compileUIDPolicy(config.LocalPolicy)
 	if err != nil {
@@ -90,7 +90,7 @@ func AttachProcessTracker(config ProcessTrackerConfig) (*ProcessTracker, error) 
 		})
 		if mapErr != nil {
 			_ = owners.Close()
-			return nil, E.Cause(mapErr, "create eBPF process UID policy map")
+			return nil, E.Cause(explainBPFPermissionError(mapErr, memlockErr), "create eBPF process UID policy map")
 		}
 		if mapErr = populateUIDPolicyMap(uidPolicy, uidEntries); mapErr != nil {
 			_ = uidPolicy.Close()

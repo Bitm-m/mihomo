@@ -188,7 +188,7 @@ func prepareTC(config TCConfig, forceLegacyTCP bool) (*TCBackend, error) {
 	); err != nil {
 		return nil, err
 	}
-	_ = raiseMemlockLimit()
+	memlockErr := raiseMemlockLimit()
 	mapOverrides := map[string]mapSpecOverride{
 		"tc_local_force_ipv4":    {name: "sb_tc_lforce4", mapType: CiliumEBPF.LPMTrie, maxEntries: maxBypassExcludeEntries, flags: bpfFlagNoPrealloc},
 		"tc_local_force_ipv6":    {name: "sb_tc_lforce6", mapType: CiliumEBPF.LPMTrie, maxEntries: maxBypassExcludeEntries, flags: bpfFlagNoPrealloc},
@@ -216,8 +216,14 @@ func prepareTC(config TCConfig, forceLegacyTCP bool) (*TCBackend, error) {
 		"tc_stats":               {name: "sb_tc_stats", mapType: CiliumEBPF.PerCPUArray, maxEntries: tcStatCount},
 	}
 	if config.EnableLocal {
+		selfMapCapacity := uint32(selfBypassSocketCapacity)
+		if config.SelfBypassMap != nil {
+			// This map is replaced before program loading; a full-size
+			// temporary map would double allocation during backend rebuilds.
+			selfMapCapacity = 1
+		}
 		mapOverrides["tc_self_sockets"] = mapSpecOverride{
-			name: "sb_self_sockets", mapType: CiliumEBPF.LRUHash, maxEntries: selfBypassSocketCapacity,
+			name: "sb_self_sockets", mapType: CiliumEBPF.LRUHash, maxEntries: selfMapCapacity,
 		}
 	}
 	legacyTCP := forceLegacyTCP || !config.EnableTCP
@@ -227,7 +233,7 @@ func prepareTC(config TCConfig, forceLegacyTCP bool) (*TCBackend, error) {
 		maps, loadedPrograms, err = loadTCResources(config, mapOverrides, true)
 	}
 	if err != nil {
-		return nil, err
+		return nil, explainBPFPermissionError(err, memlockErr)
 	}
 	controlValue := tcControl{
 		Flags:             tcFlags(config, policy),

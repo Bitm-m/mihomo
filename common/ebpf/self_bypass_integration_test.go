@@ -4,12 +4,79 @@ package ebpf
 
 import (
 	"errors"
+	"net"
 	"testing"
 	"time"
 
 	CiliumEBPF "github.com/cilium/ebpf"
 	"golang.org/x/sys/unix"
 )
+
+func TestSelfBypassLazyRegistrationIntegration(t *testing.T) {
+	requireEBPFIntegration(t, "register a socket before map preparation")
+	bypass, err := NewSelfBypassWithCapacity(8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bypass.Close()
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	raw, err := conn.SyscallConn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	registrations := make(chan error, 8)
+	for range cap(registrations) {
+		go func() { registrations <- bypass.RegisterSocket(raw) }()
+	}
+	for range cap(registrations) {
+		if err = <-registrations; err != nil {
+			t.Fatal(err)
+		}
+	}
+	sockets := bypass.Map()
+	if sockets == nil {
+		t.Fatal("registration did not prepare the map")
+	}
+	// Concurrent preparation by data planes must keep the already populated map.
+	type result struct {
+		sockets *CiliumEBPF.Map
+		err     error
+	}
+	results := make(chan result, 8)
+	for range cap(results) {
+		go func() {
+			m, err := bypass.PreparedMap()
+			results <- result{m, err}
+		}()
+	}
+	for range cap(results) {
+		r := <-results
+		if r.err != nil || r.sockets != sockets {
+			t.Fatalf("preparation replaced the registered socket map: %v", r.err)
+		}
+	}
+	var cookie uint64
+	var cookieErr error
+	if err = raw.Control(func(fd uintptr) {
+		cookie, cookieErr = unix.GetsockoptUint64(int(fd), unix.SOL_SOCKET, unix.SO_COOKIE)
+	}); err != nil || cookieErr != nil {
+		t.Fatalf("read socket cookie: %v, %v", err, cookieErr)
+	}
+	var value uint32
+	if err = sockets.Lookup(cookie, &value); err != nil || value&SocketMetadataSelfBypass == 0 {
+		t.Fatalf("socket missing from shared map: value=%d, error=%v", value, err)
+	}
+	if err = bypass.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err = bypass.RegisterSocket(raw); err != nil || bypass.Map() != nil {
+		t.Fatalf("late socket registration reopened the map: %v", err)
+	}
+}
 
 func TestSelfBypassSocketAddressReleaseIntegration(t *testing.T) {
 	requireEBPFIntegration(t, "combine socket-address marking with release cleanup")
@@ -33,6 +100,9 @@ func TestSelfBypassSocketAddressReleaseIntegration(t *testing.T) {
 			t.Error(err)
 		}
 	})
+	if err = b.Prepare(); err != nil {
+		t.Fatal(err)
+	}
 	if err = b.attachCgroupSocketAddr(path, SelfBypassCgroupConfig{EnableUDP: true}, owner); err != nil {
 		t.Fatal(err)
 	}
