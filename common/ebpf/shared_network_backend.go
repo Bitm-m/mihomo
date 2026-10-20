@@ -502,8 +502,8 @@ func (b *SharedNetworkBackend) KnownFlowUsage() MapUsage {
 }
 
 // RequestMaintenance wakes the shared flow janitor without introducing a
-// polling interval. It is used to continue bounded scans after a partial map
-// traversal.
+// polling interval. The janitor coalesces requests while a bounded scan or
+// pressure check is already scheduled.
 func (b *SharedNetworkBackend) RequestMaintenance() {
 	if b != nil {
 		b.signalFlowWake()

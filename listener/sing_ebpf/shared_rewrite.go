@@ -26,6 +26,7 @@ const (
 	sharedFlowMaxIdle               = 5 * time.Minute
 	sharedFlowPressureMaxIdle       = 15 * time.Second
 	sharedFlowPressureSweepInterval = 15 * time.Second
+	sharedFlowScanContinueInterval  = time.Second
 	sharedFlowSweepInterval         = 5 * time.Minute
 	sharedFlowPressureEnterPercent  = 70
 	sharedFlowPressureExitPercent   = 50
@@ -271,10 +272,32 @@ func (s *sharedRewrite) stopFlowJanitor() {
 
 func (s *sharedRewrite) runFlowJanitor(ctx context.Context, done chan<- struct{}) {
 	defer close(done)
+	backend := s.sharedBackendInstance()
+	if backend == nil {
+		return
+	}
+	runSharedFlowJanitor(ctx, backend, func() bool {
+		return s.dataPlane != nil && s.dataPlane.isEnabled()
+	}, func(message ...any) {
+		s.janitorWarnings.warn(s.inbound.logWarn, message...)
+	})
+}
+
+type sharedFlowJanitorBackend interface {
+	NextTCPFlowReleaseDelay(time.Time) (time.Duration, bool)
+	FlushReleasedTCPFlows(time.Time, uint32) (uint32, error)
+	TCPFlowWake() <-chan struct{}
+	KnownFlowUsage() ECommon.MapUsage
+	TokenReservationFailures() (uint64, error)
+	SweepOrphanedFlows(time.Duration, uint32) (ECommon.SharedNetworkFlowSweepResult, error)
+}
+
+func runSharedFlowJanitor(ctx context.Context, backend sharedFlowJanitorBackend, attached func() bool, warn func(...any)) {
 	sweepTimer := time.NewTimer(sharedFlowSweepInterval)
 	sweepTimerChannel := sweepTimer.C
 	var pressureTimer *time.Timer
 	var pressureTimerChannel <-chan time.Time
+	scanInProgress := false
 	resetPressureTimer := func(active bool) {
 		if !active {
 			if pressureTimer != nil {
@@ -288,8 +311,12 @@ func (s *sharedRewrite) runFlowJanitor(ctx context.Context, done chan<- struct{}
 			pressureTimerChannel = nil
 			return
 		}
+		delay := sharedFlowPressureSweepInterval
+		if scanInProgress {
+			delay = sharedFlowScanContinueInterval
+		}
 		if pressureTimer == nil {
-			pressureTimer = time.NewTimer(sharedFlowPressureSweepInterval)
+			pressureTimer = time.NewTimer(delay)
 		} else {
 			if !pressureTimer.Stop() {
 				select {
@@ -297,13 +324,13 @@ func (s *sharedRewrite) runFlowJanitor(ctx context.Context, done chan<- struct{}
 				default:
 				}
 			}
-			pressureTimer.Reset(sharedFlowPressureSweepInterval)
+			pressureTimer.Reset(delay)
 		}
 		pressureTimerChannel = pressureTimer.C
 	}
 	var releaseTimer *time.Timer
 	var releaseTimerChannel <-chan time.Time
-	resetReleaseTimer := func(backend *ECommon.SharedNetworkBackend) {
+	resetReleaseTimer := func(backend sharedFlowJanitorBackend) {
 		delay, available := backend.NextTCPFlowReleaseDelay(time.Now())
 		if !available {
 			if releaseTimer != nil {
@@ -337,8 +364,6 @@ func (s *sharedRewrite) runFlowJanitor(ctx context.Context, done chan<- struct{}
 	knownPressure := false
 	belowExitRounds := 0
 	var lastReservationFailures uint64
-	scanInProgress := false
-	attachmentActive := s.dataPlane != nil && s.dataPlane.isEnabled()
 	resetSweepTimer := func() {
 		if !sweepTimer.Stop() {
 			select {
@@ -351,10 +376,6 @@ func (s *sharedRewrite) runFlowJanitor(ctx context.Context, done chan<- struct{}
 	}
 	defer sweepTimer.Stop()
 	for {
-		backend := s.sharedBackendInstance()
-		if backend == nil {
-			return
-		}
 		sweepRequested := false
 		select {
 		case <-ctx.Done():
@@ -371,7 +392,9 @@ func (s *sharedRewrite) runFlowJanitor(ctx context.Context, done chan<- struct{}
 				scanInProgress,
 				backend.KnownFlowUsage(),
 			)
-			if !sweepRequested {
+			// Flow churn must not bypass the maintenance budget or keep
+			// postponing its timer. Releases still get their own deadline.
+			if !sweepRequested || pressureTimerChannel != nil {
 				continue
 			}
 		case <-releaseTimerChannel:
@@ -380,13 +403,12 @@ func (s *sharedRewrite) runFlowJanitor(ctx context.Context, done chan<- struct{}
 		if !sweepRequested {
 			_, flushErr := backend.FlushReleasedTCPFlows(now, sharedFlowReleaseFlushBudget)
 			if flushErr != nil {
-				s.janitorWarnings.warn(s.inbound.logWarn, "flush released shared-network TCP flows: ", flushErr)
+				warn("flush released shared-network TCP flows: ", flushErr)
 			}
 			resetReleaseTimer(backend)
 			continue
 		}
-		if s.dataPlane == nil || !s.dataPlane.isEnabled() {
-			attachmentActive = false
+		if !attached() {
 			pressure = false
 			knownPressure = false
 			belowExitRounds = 0
@@ -395,27 +417,24 @@ func (s *sharedRewrite) runFlowJanitor(ctx context.Context, done chan<- struct{}
 			resetPressureTimer(false)
 			continue
 		}
-		if !attachmentActive {
-			attachmentActive = true
-		}
 		reservationPressure := false
 		reservationFailures, failureErr := backend.TokenReservationFailures()
 		if failureErr != nil {
-			s.janitorWarnings.warn(s.inbound.logWarn, "read shared-network token reservation failures: ", failureErr)
+			warn("read shared-network token reservation failures: ", failureErr)
 		} else {
 			reservationPressure = reservationFailures > lastReservationFailures
 			lastReservationFailures = reservationFailures
 		}
 		maxIdle := sharedFlowMaxIdle
-		if pressure || reservationPressure {
+		if pressure || knownPressure || reservationPressure {
 			maxIdle = sharedFlowPressureMaxIdle
 		}
 		result, err := backend.SweepOrphanedFlows(maxIdle, sharedFlowFallbackScanBudget)
 		if err != nil {
-			if reservationPressure {
+			if reservationPressure || knownPressure {
 				pressure = true
 			}
-			s.janitorWarnings.warn(s.inbound.logWarn, "sweep orphaned shared-network flows: ", err)
+			warn("sweep orphaned shared-network flows: ", err)
 			resetPressureTimer(pressure || scanInProgress)
 		} else {
 			scanInProgress = !result.Complete
@@ -423,7 +442,6 @@ func (s *sharedRewrite) runFlowJanitor(ctx context.Context, done chan<- struct{}
 				resetSweepTimer()
 			}
 			if !result.Complete {
-				backend.RequestMaintenance()
 				resetSweepTimer()
 				resetPressureTimer(true)
 				continue

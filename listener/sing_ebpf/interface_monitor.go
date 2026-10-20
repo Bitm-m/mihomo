@@ -191,7 +191,11 @@ func (i *Inbound) setDefaultInterfaceName(interfaceName string) {
 	state.access.Unlock()
 	if active {
 		if changed {
-			netchange.Notify()
+			if interfaceName != "" {
+				netchange.Notify()
+			} else {
+				netchange.NotifyUnavailable()
+			}
 		}
 		notifyTCInterfaceUpdate(updates)
 	}
